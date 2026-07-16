@@ -17,7 +17,6 @@ from llm_loader import init_custom_llm
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-
 DB_PATH = BASE_DIR / "chroma_db_J-Eats"
 COLLECTION_NAME = "jeonju_restaurants"
 
@@ -26,25 +25,20 @@ MAX_COUNT = 10
 
 
 # =========================================================
-# 2. LLM 및 임베딩 모델
+# 2. LLM / 임베딩 / Chroma DB
 # =========================================================
 
 llm = init_custom_llm()
 
-# embedding.py에서 사용한 모델과 같아야 합니다.
+# embedding.py에서 DB를 만들 때 사용한 모델과 같아야 합니다.
 embedding = HuggingFaceEmbeddings(
     model_name="BAAI/bge-m3"
 )
 
-
-# =========================================================
-# 3. Chroma DB 연결
-# =========================================================
-
 db = Chroma(
     persist_directory=str(DB_PATH),
     collection_name=COLLECTION_NAME,
-    embedding_function=embedding
+    embedding_function=embedding,
 )
 
 print("=" * 60)
@@ -56,7 +50,7 @@ print("=" * 60)
 
 
 # =========================================================
-# 4. 문자열 정규화
+# 3. 문자열 정규화
 # =========================================================
 
 TEXT_REPLACEMENTS = {
@@ -69,14 +63,7 @@ TEXT_REPLACEMENTS = {
 
 
 def normalize_text(value):
-    """
-    띄어쓰기와 기호 차이를 제거해 검색 정확도를 높입니다.
-
-    예:
-    패스트 푸드 → 패스트푸드
-    콩나물 국밥 → 콩나물국밥
-    돈까스 → 돈가스
-    """
+    """검색 비교를 위해 공백과 기호, 표기 차이를 정리합니다."""
 
     if value is None:
         return ""
@@ -86,29 +73,16 @@ def normalize_text(value):
     for before, after in TEXT_REPLACEMENTS.items():
         text = text.replace(before, after)
 
-    text = re.sub(
-        r"[\s·,/()\[\]{}_\-]+",
-        "",
-        text
-    )
-
-    return text
+    # 마침표나 쉼표가 포함돼도 부정 표현을 인식하도록 모든 기호 제거
+    return re.sub(r"[^0-9a-z가-힣]+", "", text)
 
 
 # =========================================================
-# 5. Chroma 문서 파싱
+# 4. Chroma 문서 파싱 및 전체 식당 로드
 # =========================================================
+
 
 def parse_document(content):
-    """
-    CSVLoader로 저장된 문서를 딕셔너리로 변환합니다.
-
-    예:
-    상호명: 금암피순대
-    카테고리: 국물 요리
-    업종: 순대,순댓국
-    """
-
     data = {}
 
     if not content:
@@ -119,17 +93,12 @@ def parse_document(content):
             continue
 
         key, value = line.split(":", 1)
-
         data[key.strip()] = value.strip()
 
     return data
 
 
 def is_valid_restaurant(data):
-    """
-    빈 행이나 정상적인 식당이 아닌 문서를 제외합니다.
-    """
-
     return bool(
         data.get("상호명")
         and data.get("주소")
@@ -137,17 +106,9 @@ def is_valid_restaurant(data):
     )
 
 
-# =========================================================
-# 6. DB 전체 식당 불러오기
-# =========================================================
-
 def load_all_restaurants():
     result = db.get(
-        include=[
-            "documents",
-            "metadatas",
-            "embeddings"
-        ]
+        include=["documents", "metadatas", "embeddings"]
     )
 
     documents = result.get("documents") or []
@@ -162,27 +123,25 @@ def load_all_restaurants():
         if not is_valid_restaurant(data):
             continue
 
-        metadata = {}
-
-        if index < len(metadatas):
-            if metadatas[index]:
-                metadata = metadatas[index]
+        metadata = (
+            metadatas[index]
+            if index < len(metadatas) and metadatas[index]
+            else {}
+        )
 
         vector = None
-
-        if stored_embeddings is not None:
-            if index < len(stored_embeddings):
-                vector = np.asarray(
-                    stored_embeddings[index],
-                    dtype=np.float32
-                )
+        if stored_embeddings is not None and index < len(stored_embeddings):
+            vector = np.asarray(
+                stored_embeddings[index],
+                dtype=np.float32,
+            )
 
         restaurants.append(
             {
                 "content": content,
                 "data": data,
                 "metadata": metadata,
-                "embedding": vector
+                "embedding": vector,
             }
         )
 
@@ -190,59 +149,60 @@ def load_all_restaurants():
 
 
 ALL_RESTAURANTS = load_all_restaurants()
-
 print("정상 식당 데이터 수:", len(ALL_RESTAURANTS))
 
 
 # =========================================================
-# 7. 식당 검색용 문자열
+# 5. 검색용 문자열 구성
 # =========================================================
 
-def make_food_search_text(data):
-    """
-    카테고리뿐 아니라 업종과 메인메뉴까지 모두 검색합니다.
-    """
 
+def make_food_search_text(data):
     return normalize_text(
         " ".join(
             [
                 data.get("상호명", ""),
                 data.get("카테고리", ""),
                 data.get("업종", ""),
-                data.get("메인메뉴", "")
+                data.get("메인메뉴", ""),
+            ]
+        )
+    )
+
+
+def make_category_search_text(data):
+    # 카테고리뿐 아니라 '요리주점', '일식당' 같은 업종도 함께 검사
+    return normalize_text(
+        " ".join(
+            [
+                data.get("카테고리", ""),
+                data.get("업종", ""),
             ]
         )
     )
 
 
 def make_region_search_text(data):
-    """
-    지역권과 실제 주소를 함께 검색합니다.
-    """
-
     return normalize_text(
         " ".join(
             [
                 data.get("지역권", ""),
                 data.get("주소", ""),
-                data.get("상호명", "")
+                data.get("상호명", ""),
             ]
         )
     )
 
 
 for restaurant in ALL_RESTAURANTS:
-    restaurant["food_search_text"] = make_food_search_text(
-        restaurant["data"]
-    )
-
-    restaurant["region_search_text"] = make_region_search_text(
-        restaurant["data"]
-    )
+    data = restaurant["data"]
+    restaurant["food_search_text"] = make_food_search_text(data)
+    restaurant["category_search_text"] = make_category_search_text(data)
+    restaurant["region_search_text"] = make_region_search_text(data)
 
 
 # =========================================================
-# 8. DB에서 카테고리 목록 자동 생성
+# 6. 카테고리 및 지역 검색어 구성
 # =========================================================
 
 CATEGORY_VALUES = sorted(
@@ -252,26 +212,55 @@ CATEGORY_VALUES = sorted(
         if restaurant["data"].get("카테고리", "").strip()
     },
     key=len,
-    reverse=True
+    reverse=True,
 )
 
-print("검색 가능한 카테고리:", CATEGORY_VALUES)
+# 사용자가 실제 데이터의 표현과 다르게 말해도 대표 카테고리로 연결합니다.
+CATEGORY_EXTRA_ALIASES = {
+    "한식": {"한식", "한식집", "백반집"},
+    "일식": {"일식", "일식집", "일본식", "일식당"},
+    "중식": {"중식", "중식집", "중국집", "중국요리"},
+    "양식": {"양식", "양식집", "서양식"},
+    "분식": {"분식", "분식집"},
+    "고기": {"고기", "고깃집", "고기집", "육류"},
+    "해산물": {"해산물", "횟집", "수산물"},
+    "국물 요리": {"국물요리", "국물음식"},
+    "주점": {
+        "주점",
+        "술집",
+        "포차",
+        "호프집",
+        "펍",
+        "요리주점",
+    },
+    "패스트 푸드": {"패스트푸드", "패스트푸드점"},
+}
 
 
-# =========================================================
-# 9. DB에서 지역 검색어 자동 생성
-# =========================================================
+def build_category_aliases():
+    aliases = {}
+
+    for category in CATEGORY_VALUES:
+        category_aliases = {
+            normalize_text(category),
+            normalize_text(category.replace(" ", "")),
+        }
+
+        for alias in CATEGORY_EXTRA_ALIASES.get(category, set()):
+            normalized_alias = normalize_text(alias)
+            if len(normalized_alias) >= 2:
+                category_aliases.add(normalized_alias)
+
+        aliases[category] = category_aliases
+
+    return aliases
+
+
+CATEGORY_ALIASES = build_category_aliases()
+
 
 def build_region_aliases():
-    """
-    지역권 데이터에서 검색 가능한 지역명을 자동 생성합니다.
-
-    예:
-    전북대·덕진공원권
-        → 전북대
-        → 덕진공원
-        → 전북대덕진공원
-    """
+    """지역권 컬럼에서 검색 가능한 지역 별칭을 자동 생성합니다."""
 
     aliases = {}
 
@@ -282,49 +271,42 @@ def build_region_aliases():
     }
 
     for region_value in region_values:
-        region_without_suffix = region_value.replace("권", "")
+        without_suffix = region_value[:-1] if region_value.endswith("권") else region_value
 
-        candidate_aliases = {
+        candidates = {
             normalize_text(region_value),
-            normalize_text(region_without_suffix)
+            normalize_text(without_suffix),
         }
 
-        parts = re.split(
-            r"[·,/]",
-            region_without_suffix
-        )
+        for part in re.split(r"[·,/]", without_suffix):
+            normalized_part = normalize_text(part)
+            if len(normalized_part) >= 2:
+                candidates.add(normalized_part)
 
-        for part in parts:
-            part = part.strip()
-
-            if part:
-                candidate_aliases.add(
-                    normalize_text(part)
-                )
-
-        for alias in candidate_aliases:
+        for alias in candidates:
             if len(alias) < 2:
                 continue
+            aliases.setdefault(alias, set()).add(region_value)
 
-            if alias not in aliases:
-                aliases[alias] = set()
-
-            aliases[alias].add(region_value)
+    # 데이터에 없는 일상 표현 보완
+    if any("전북대" in value for value in region_values):
+        aliases.setdefault("전대", set()).update(
+            value for value in region_values if "전북대" in value
+        )
 
     return aliases
 
 
 REGION_ALIASES = build_region_aliases()
 
-print(
-    "검색 가능한 지역어:",
-    sorted(REGION_ALIASES.keys())
-)
+print("검색 가능한 카테고리:", CATEGORY_VALUES)
+print("검색 가능한 지역어:", sorted(REGION_ALIASES.keys()))
 
 
 # =========================================================
-# 10. 대화 조건 초기값
+# 7. 검색 상태
 # =========================================================
+
 
 def initial_filter_state():
     return {
@@ -332,23 +314,18 @@ def initial_filter_state():
         "solo": False,
         "family": False,
         "group": False,
-
         "include_categories": [],
         "exclude_categories": [],
-
         "include_regions": [],
         "exclude_regions": [],
-
-        # 업종·메인메뉴에서 직접 검색할 일반 음식어
         "search_terms": [],
         "exclude_terms": [],
-
-        "count": DEFAULT_COUNT
+        "count": DEFAULT_COUNT,
     }
 
 
 # =========================================================
-# 11. 일반 검색어 설정
+# 8. 질문 단어 정리
 # =========================================================
 
 STOPWORDS = {
@@ -387,7 +364,18 @@ STOPWORDS = {
     "제외",
     "아닌",
     "좀",
-    "한번"
+    "한번",
+    "싫어",
+    "싫어요",
+    "별로",
+    "별로야",
+    "안땡겨",
+    "안당겨",
+    "식당",
+    "맛집",
+    "음식점",
+    "가게",
+    "주차장",
 }
 
 GENERIC_SUFFIXES = [
@@ -395,47 +383,78 @@ GENERIC_SUFFIXES = [
     "맛집",
     "식당",
     "가게",
-    "집"
+    "집",
 ]
 
+# 조사 때문에 '국밥을', '주점은'이 검색되지 않는 문제를 방지합니다.
+TOKEN_PARTICLES = sorted(
+    [
+        "에서는",
+        "으로는",
+        "한테는",
+        "에게는",
+        "부터",
+        "까지",
+        "에서",
+        "으로",
+        "에게",
+        "한테",
+        "이랑",
+        "하고",
+        "처럼",
+        "보다",
+        "은",
+        "는",
+        "이",
+        "가",
+        "을",
+        "를",
+        "도",
+        "만",
+        "로",
+        "과",
+        "와",
+        "랑",
+    ],
+    key=len,
+    reverse=True,
+)
 
-def remove_generic_suffix(token):
-    """
-    국밥집 → 국밥
-    파스타집 → 파스타
-    곱창 맛집 → 곱창
-    """
 
+def clean_query_token(token):
     token = normalize_text(token)
 
     changed = True
-
-    while changed:
+    while changed and len(token) >= 2:
         changed = False
 
+        # 조사부터 제거: 국밥집은 -> 국밥집
+        for particle in TOKEN_PARTICLES:
+            normalized_particle = normalize_text(particle)
+            if token.endswith(normalized_particle):
+                candidate = token[: -len(normalized_particle)]
+                if len(candidate) >= 2:
+                    token = candidate
+                    changed = True
+                    break
+
+        if changed:
+            continue
+
+        # 일반 접미사 제거: 국밥집 -> 국밥
         for suffix in GENERIC_SUFFIXES:
             normalized_suffix = normalize_text(suffix)
-
-            if (
-                token.endswith(normalized_suffix)
-                and len(token) > len(normalized_suffix) + 1
-            ):
-                token = token[:-len(normalized_suffix)]
-                changed = True
-                break
+            if token.endswith(normalized_suffix):
+                candidate = token[: -len(normalized_suffix)]
+                if len(candidate) >= 2:
+                    token = candidate
+                    changed = True
+                    break
 
     return token
 
 
 def term_exists_in_data(term):
-    """
-    질문의 단어가 실제 DB 식당 데이터에 존재하는지 확인합니다.
-
-    따라서 국밥만 따로 등록하지 않아도
-    곱창, 파스타, 오코노미야끼, 우육면 등
-    DB에 존재하는 메뉴는 모두 검색됩니다.
-    """
-
     normalized_term = normalize_text(term)
 
     if len(normalized_term) < 2:
@@ -448,212 +467,241 @@ def term_exists_in_data(term):
 
 
 # =========================================================
-# 12. 부정 표현 판별
+# 9. 부정 표현 판별
 # =========================================================
 
-def is_negative_expression(
-    normalized_question,
-    normalized_term
-):
+NEGATIVE_EXPRESSIONS = [
+    "말고",
+    "빼고",
+    "빼줘",
+    "제외",
+    "제외해줘",
+    "아닌",
+    "아니고",
+    "싫어",
+    "싫어요",
+    "싫습니다",
+    "별로",
+    "별로야",
+    "안땡겨",
+    "안당겨",
+    "원하지않아",
+    "원하지않아요",
+    "원치않아",
+    "피하고싶어",
+    "추천하지마",
+    "추천하지말아줘",
+    "안돼",
+    "안됨",
+]
+
+NEGATIVE_PREFIXES = [
+    "싫은",
+    "싫어하는",
+    "제외할",
+    "피하고싶은",
+    "원하지않는",
+]
+
+NEGATIVE_PARTICLES = sorted(
+    set(TOKEN_PARTICLES + ["같은", "쪽은", "쪽은", "종류는"]),
+    key=len,
+    reverse=True,
+)
+
+
+def is_negative_expression(question, term):
     """
-    다음과 같은 표현을 판별합니다.
-
-    일식집 말고
-    국밥 빼고
-    전북대 제외
-    파스타 아닌 곳
+    '주점은 싫어', '주점은 진짜 별로야', '싫은 주점' 등을
+    제외 조건으로 판별합니다. 문장 부호를 기준으로 절을 나눠
+    다른 절의 부정어가 엉뚱한 단어에 적용되지 않게 합니다.
     """
 
-    patterns = [
-        normalized_term + "말고",
-        normalized_term + "집말고",
-        normalized_term + "빼고",
-        normalized_term + "집빼고",
-        normalized_term + "제외",
-        normalized_term + "집제외",
-        normalized_term + "아닌",
-        normalized_term + "집아닌"
-    ]
+    normalized_term = normalize_text(term)
 
-    return any(
-        pattern in normalized_question
-        for pattern in patterns
+    if not normalized_term:
+        return False
+
+    # '주차장 있는 식당. 주점은 싫어'에서 식당까지 부정되는
+    # 오검출을 막기 위해 문장/절 단위로 검사합니다.
+    clauses = re.split(
+        r"[.!?,;:\n]+|(?:그리고|하지만|그런데|근데)",
+        str(question),
     )
 
-
-# =========================================================
-# 13. 추천 개수 추출
-# =========================================================
-
-def extract_count(question):
-    match = re.search(
-        r"(\d+)\s*(곳|개|군데)",
-        question
-    )
-
-    if match:
-        count = int(match.group(1))
-
-        return max(
-            1,
-            min(count, MAX_COUNT)
-        )
-
-    normalized_question = normalize_text(question)
-
-    korean_counts = {
-        "한곳": 1,
-        "한군데": 1,
-        "두곳": 2,
-        "두군데": 2,
-        "세곳": 3,
-        "세군데": 3,
-        "네곳": 4,
-        "네군데": 4,
-        "다섯곳": 5,
-        "다섯군데": 5
+    term_variants = {
+        normalized_term,
+        normalized_term + "집",
     }
 
-    for expression, count in korean_counts.items():
-        if expression in normalized_question:
-            return count
+    normalized_negatives = [normalize_text(value) for value in NEGATIVE_EXPRESSIONS]
+    normalized_prefixes = [normalize_text(value) for value in NEGATIVE_PREFIXES]
+    normalized_particles = [normalize_text(value) for value in NEGATIVE_PARTICLES]
+
+    # 부정어 앞에 올 수 있는 짧은 강조 표현만 허용합니다.
+    allowed_fillers = {
+        "",
+        "진짜",
+        "정말",
+        "너무",
+        "좀",
+        "그닥",
+        "딱히",
+        "아예",
+        "별로",
+    }
+
+    for clause in clauses:
+        normalized_clause = normalize_text(clause)
+
+        for variant in term_variants:
+            start = 0
+
+            while True:
+                index = normalized_clause.find(variant, start)
+                if index < 0:
+                    break
+
+                before = normalized_clause[max(0, index - 10):index]
+                after_start = index + len(variant)
+                after = normalized_clause[after_start:after_start + 24]
+
+                # '싫은 주점', '제외할 주점'
+                if any(before.endswith(prefix) for prefix in normalized_prefixes):
+                    return True
+
+                trimmed_after = after
+                for particle in normalized_particles:
+                    if trimmed_after.startswith(particle):
+                        trimmed_after = trimmed_after[len(particle):]
+                        break
+
+                for negative in normalized_negatives:
+                    negative_index = trimmed_after.find(negative)
+
+                    if negative_index < 0:
+                        continue
+
+                    between = trimmed_after[:negative_index]
+
+                    if between in allowed_fillers:
+                        return True
+
+                start = index + len(variant)
+
+    return False
+
+
+# =========================================================
+# 10. 추천 개수 / 카테고리 / 지역 / 메뉴 조건 추출
+# =========================================================
+
+
+def extract_count(question):
+    numeric_match = re.search(
+        r"(?<![0-9가-힣a-zA-Z])(\d+)\s*(곳|개|군데)(?:만)?",
+        question,
+    )
+
+    if numeric_match:
+        return max(1, min(int(numeric_match.group(1)), MAX_COUNT))
+
+    korean_number_map = {
+        "한": 1,
+        "두": 2,
+        "세": 3,
+        "네": 4,
+        "다섯": 5,
+    }
+
+    korean_match = re.search(
+        r"(?<![가-힣a-zA-Z0-9])(한|두|세|네|다섯)\s*(곳|개|군데)(?:만)?",
+        question,
+    )
+
+    if korean_match:
+        return korean_number_map[korean_match.group(1)]
 
     return None
 
-
-# =========================================================
-# 14. 카테고리 조건 추출
-# =========================================================
 
 def extract_category_conditions(question):
     normalized_question = normalize_text(question)
 
     included = []
     excluded = []
+    matched_aliases = []
 
-    for category in CATEGORY_VALUES:
-        normalized_category = normalize_text(category)
+    for category, aliases in CATEGORY_ALIASES.items():
+        mentioned = [alias for alias in aliases if alias in normalized_question]
 
-        if normalized_category not in normalized_question:
+        if not mentioned:
             continue
 
-        if is_negative_expression(
-            normalized_question,
-            normalized_category
-        ):
-            excluded.append(category)
+        matched_aliases.extend(mentioned)
 
+        if any(is_negative_expression(question, alias) for alias in mentioned):
+            excluded.append(category)
         else:
             included.append(category)
 
     return (
         list(dict.fromkeys(included)),
-        list(dict.fromkeys(excluded))
+        list(dict.fromkeys(excluded)),
+        list(dict.fromkeys(matched_aliases)),
     )
 
 
-# =========================================================
-# 15. 지역 조건 추출
-# =========================================================
+def keep_most_specific_aliases(aliases):
+    """긴 지역명이 잡히면 그 안에 포함된 짧은 중복 별칭은 제거합니다."""
+
+    result = []
+
+    for alias in sorted(set(aliases), key=len, reverse=True):
+        if any(alias in selected for selected in result):
+            continue
+        result.append(alias)
+
+    return result
+
 
 def extract_region_conditions(question):
     normalized_question = normalize_text(question)
 
     included = []
     excluded = []
+    matched_aliases = []
 
-    # 긴 지역명부터 검사
-    aliases = sorted(
-        REGION_ALIASES.keys(),
-        key=len,
-        reverse=True
-    )
-
-    for alias in aliases:
+    for alias in sorted(REGION_ALIASES.keys(), key=len, reverse=True):
         if alias not in normalized_question:
             continue
 
-        if is_negative_expression(
-            normalized_question,
-            alias
-        ):
-            excluded.append(alias)
+        matched_aliases.append(alias)
 
+        if is_negative_expression(question, alias):
+            excluded.append(alias)
         else:
             included.append(alias)
 
-    # 전북대덕진공원과 전북대가 동시에 잡히는 경우 중복 정리
-    included = remove_contained_terms(included)
-    excluded = remove_contained_terms(excluded)
-
-    return included, excluded
-
-
-def remove_contained_terms(terms):
-    """
-    긴 표현과 짧은 표현이 동시에 감지되면
-    실제 검색에 유용한 짧은 지역 단위를 유지합니다.
-
-    예:
-    전북대덕진공원, 전북대
-    """
-
-    unique_terms = list(dict.fromkeys(terms))
-
-    result = []
-
-    for term in sorted(unique_terms, key=len):
-        if term not in result:
-            result.append(term)
-
-    return result
-
-
-# =========================================================
-# 16. 자유 음식 검색어 추출
-# =========================================================
-
-def extract_search_terms(
-    question,
-    detected_categories,
-    excluded_categories,
-    detected_regions,
-    excluded_regions
-):
-    """
-    카테고리나 지역이 아닌 나머지 질문 단어 중
-    실제 DB의 업종·메인메뉴에 있는 단어를 자동 검색합니다.
-    """
-
-    normalized_question = normalize_text(question)
-
-    tokens = re.findall(
-        r"[가-힣a-zA-Z0-9]+",
-        question
+    return (
+        keep_most_specific_aliases(included),
+        keep_most_specific_aliases(excluded),
+        keep_most_specific_aliases(matched_aliases),
     )
 
-    blocked_values = []
 
-    for value in (
-        detected_categories
-        + excluded_categories
-        + detected_regions
-        + excluded_regions
-    ):
-        blocked_values.append(
-            normalize_text(value)
-        )
+def extract_search_terms(question, blocked_aliases):
+    tokens = re.findall(r"[가-힣a-zA-Z0-9]+", question)
 
     included = []
     excluded = []
 
-    normalized_stopwords = {
-        normalize_text(word)
-        for word in STOPWORDS
-    }
+    normalized_stopwords = {normalize_text(word) for word in STOPWORDS}
+    normalized_blocked = [normalize_text(value) for value in blocked_aliases]
 
-    condition_words = [
+    condition_words = {
         "주차",
+        "주차장",
         "혼밥",
         "혼자",
         "가족",
@@ -662,70 +710,90 @@ def extract_search_terms(
         "단체",
         "회식",
         "모임",
-        "1인"
-    ]
+        "1인",
+    }
 
     for token in tokens:
-        term = remove_generic_suffix(token)
+        term = clean_query_token(token)
 
-        if len(term) < 2:
-            continue
-
-        if term in normalized_stopwords:
+        if len(term) < 2 or term in normalized_stopwords:
             continue
 
         if any(
-            normalize_text(word) in term
-            or term in normalize_text(word)
+            normalize_text(word) in term or term in normalize_text(word)
             for word in condition_words
         ):
             continue
 
-        # 이미 카테고리나 지역으로 인식한 단어는 제외
-        if any(
-            term in blocked
-            or blocked in term
-            for blocked in blocked_values
-        ):
+        if any(term in blocked or blocked in term for blocked in normalized_blocked):
             continue
 
-        # DB에 실제 존재하지 않는 단어는 구조 필터로 사용하지 않음
-        # 이런 표현은 이후 임베딩 유사도 검색이 처리합니다.
         if not term_exists_in_data(term):
             continue
 
-        if is_negative_expression(
-            normalized_question,
-            term
-        ):
+        if is_negative_expression(question, term):
             excluded.append(term)
-
         else:
             included.append(term)
 
     return (
         list(dict.fromkeys(included)),
-        list(dict.fromkeys(excluded))
+        list(dict.fromkeys(excluded)),
     )
 
 
 # =========================================================
-# 17. 대화 조건 업데이트
+# 11. 대화 상태 업데이트
 # =========================================================
 
-def update_filter_state(
-    question,
-    previous_state=None
-):
-    state = copy.deepcopy(
-        previous_state or initial_filter_state()
-    )
+
+def is_new_standalone_search(question, previous_state):
+    """
+    완전한 새 질문이면 이전 메뉴/지역 조건이 남지 않도록 합니다.
+    짧은 후속 질문('그중', '일식 말고')은 기존 조건을 유지합니다.
+    """
+
+    if previous_state is None:
+        return False
 
     normalized_question = normalize_text(question)
 
-    # -----------------------------------------------------
-    # 조건 초기화
-    # -----------------------------------------------------
+    follow_up_markers = [
+        "그중",
+        "거기서",
+        "그곳에서",
+        "그럼",
+        "그거",
+        "방금",
+        "아까",
+        "이번에는",
+    ]
+
+    if any(marker in normalized_question for marker in follow_up_markers):
+        return False
+
+    # '주점은 싫어', '일식 말고'처럼 제외 조건만 말한 경우는 후속 질문
+    has_negative = any(
+        normalize_text(negative) in normalized_question
+        for negative in NEGATIVE_EXPRESSIONS
+    )
+
+    generic_search_words = ["맛집", "식당", "음식점", "추천해줘", "찾아줘"]
+
+    if any(word in normalized_question for word in generic_search_words):
+        return True
+
+    return not has_negative and len(normalized_question) >= 8
+
+
+def update_filter_state(question, previous_state=None):
+    # 새 검색으로 판단되면 오래된 메뉴·지역 조건을 먼저 제거합니다.
+    if is_new_standalone_search(question, previous_state):
+        state = initial_filter_state()
+    else:
+        state = copy.deepcopy(previous_state or initial_filter_state())
+
+    normalized_question = normalize_text(question)
 
     reset_words = [
         "조건초기화",
@@ -733,132 +801,73 @@ def update_filter_state(
         "처음부터",
         "새로검색",
         "새로추천",
-        "조건다지워"
+        "조건다지워",
     ]
 
-    if any(
-        word in normalized_question
-        for word in reset_words
-    ):
+    if any(word in normalized_question for word in reset_words):
         state = initial_filter_state()
 
-    # -----------------------------------------------------
-    # 추천 개수
-    # -----------------------------------------------------
-
     requested_count = extract_count(question)
-
     if requested_count is not None:
         state["count"] = requested_count
 
-    # -----------------------------------------------------
     # 주차 조건
-    # -----------------------------------------------------
-
-    parking_reset_words = [
-        "주차상관없",
-        "주차필요없",
-        "주차장없어도",
-        "주차조건빼"
-    ]
-
     if any(
         word in normalized_question
-        for word in parking_reset_words
+        for word in ["주차상관없", "주차필요없", "주차장없어도", "주차조건빼"]
     ):
         state["parking"] = False
-
     elif "주차" in normalized_question:
         state["parking"] = True
 
-    # -----------------------------------------------------
     # 혼밥 조건
-    # -----------------------------------------------------
-
-    if (
-        "혼밥" in normalized_question
-        or "혼자" in normalized_question
-        or "1인" in normalized_question
-    ):
+    if any(word in normalized_question for word in ["혼밥", "혼자", "1인"]):
         state["solo"] = True
-
-    if (
-        "혼밥상관없" in normalized_question
-        or "혼자아니어도" in normalized_question
-    ):
+    if any(word in normalized_question for word in ["혼밥상관없", "혼자아니어도"]):
         state["solo"] = False
 
-    # -----------------------------------------------------
     # 가족식사 조건
-    # -----------------------------------------------------
-
-    if (
-        "가족" in normalized_question
-        or "부모님" in normalized_question
-        or "아이와" in normalized_question
-    ):
+    if any(word in normalized_question for word in ["가족", "부모님", "아이와"]):
         state["family"] = True
-
     if "가족식사상관없" in normalized_question:
         state["family"] = False
 
-    # -----------------------------------------------------
     # 단체수용 조건
-    # -----------------------------------------------------
-
-    if (
-        "단체" in normalized_question
-        or "회식" in normalized_question
-        or "모임" in normalized_question
-    ):
+    if any(word in normalized_question for word in ["단체", "회식", "모임"]):
         state["group"] = True
-
-    if (
-        "단체상관없" in normalized_question
-        or "회식아니어도" in normalized_question
-    ):
+    if any(word in normalized_question for word in ["단체상관없", "회식아니어도"]):
         state["group"] = False
 
-    # -----------------------------------------------------
-    # 카테고리 및 지역 추출
-    # -----------------------------------------------------
+    (
+        included_categories,
+        excluded_categories,
+        matched_category_aliases,
+    ) = extract_category_conditions(question)
 
-    included_categories, excluded_categories = (
-        extract_category_conditions(question)
-    )
-
-    included_regions, excluded_regions = (
-        extract_region_conditions(question)
-    )
-
-    # -----------------------------------------------------
-    # 모든 업종·메인메뉴를 대상으로 음식어 자동 추출
-    # -----------------------------------------------------
+    (
+        included_regions,
+        excluded_regions,
+        matched_region_aliases,
+    ) = extract_region_conditions(question)
 
     included_terms, excluded_terms = extract_search_terms(
         question,
-        included_categories,
-        excluded_categories,
-        included_regions,
-        excluded_regions
+        matched_category_aliases + matched_region_aliases,
     )
 
-    # -----------------------------------------------------
-    # 카테고리 상태 갱신
-    # -----------------------------------------------------
-
+    # 새 포함 카테고리는 이전 포함 카테고리를 대체합니다.
     if included_categories:
         state["include_categories"] = included_categories
-
-        # 새로운 카테고리를 직접 요청했다면
-        # 이전 메뉴 조건은 제거합니다.
-        if not included_terms:
-            state["search_terms"] = []
 
         for category in included_categories:
             if category in state["exclude_categories"]:
                 state["exclude_categories"].remove(category)
 
+        # 구체 메뉴가 없는 새 카테고리 질문은 이전 메뉴 조건을 해제
+        if not included_terms:
+            state["search_terms"] = []
+
+    # 제외 카테고리는 누적하되 과거 포함 조건에서는 제거합니다.
     for category in excluded_categories:
         if category not in state["exclude_categories"]:
             state["exclude_categories"].append(category)
@@ -866,10 +875,7 @@ def update_filter_state(
         if category in state["include_categories"]:
             state["include_categories"].remove(category)
 
-    # -----------------------------------------------------
-    # 지역 상태 갱신
-    # -----------------------------------------------------
-
+    # 새 지역은 이전 지역을 대체합니다.
     if included_regions:
         state["include_regions"] = included_regions
 
@@ -884,35 +890,24 @@ def update_filter_state(
         if region in state["include_regions"]:
             state["include_regions"].remove(region)
 
-    region_reset_words = [
-        "지역상관없",
-        "아무지역",
-        "전주전체",
-        "지역조건빼"
-    ]
-
     if any(
         word in normalized_question
-        for word in region_reset_words
+        for word in ["지역상관없", "아무지역", "전주전체", "지역조건빼"]
     ):
         state["include_regions"] = []
         state["exclude_regions"] = []
 
-    # -----------------------------------------------------
-    # 메뉴·업종 검색어 상태 갱신
-    # -----------------------------------------------------
-
+    # 새 구체 메뉴는 이전 구체 메뉴를 대체합니다.
     if included_terms:
         state["search_terms"] = included_terms
-
-        # 국밥처럼 구체적인 새 메뉴를 요청하면서
-        # 이번 질문에 카테고리가 없다면 이전 카테고리를 해제
-        if not included_categories:
-            state["include_categories"] = []
 
         for term in included_terms:
             if term in state["exclude_terms"]:
                 state["exclude_terms"].remove(term)
+
+        # 새 메뉴만 지정하면 이전 카테고리 제한은 해제
+        if not included_categories:
+            state["include_categories"] = []
 
     for term in excluded_terms:
         if term not in state["exclude_terms"]:
@@ -921,28 +916,27 @@ def update_filter_state(
         if term in state["search_terms"]:
             state["search_terms"].remove(term)
 
-    food_reset_words = [
-        "메뉴상관없",
-        "음식상관없",
-        "종류상관없",
-        "아무거나"
-    ]
-
     if any(
         word in normalized_question
-        for word in food_reset_words
+        for word in ["메뉴상관없", "음식상관없", "종류상관없", "아무거나"]
     ):
         state["search_terms"] = []
         state["exclude_terms"] = []
         state["include_categories"] = []
         state["exclude_categories"] = []
 
+    print("포함 카테고리:", state["include_categories"])
+    print("제외 카테고리:", state["exclude_categories"])
+    print("포함 지역:", state["include_regions"])
+    print("검색 메뉴:", state["search_terms"])
+
     return state
 
 
 # =========================================================
-# 18. 주차 가능 여부
+# 12. 조건 판별 및 필터링
 # =========================================================
+
 
 def is_parking_available(value):
     normalized_value = normalize_text(value)
@@ -950,21 +944,7 @@ def is_parking_available(value):
     if not normalized_value:
         return False
 
-    # 주차시설이 전혀 없는 경우
-    unavailable_values = {
-        "없음",
-        "전용없음",
-        "전용없음골목",
-        "주차불가"
-    }
-
-    if normalized_value in unavailable_values:
-        return False
-
-    if "주차불가" in normalized_value:
-        return False
-
-    # 공영주차장이나 유료주차도 주차 가능으로 처리
+    # 공영/유료 주차가 함께 적힌 경우는 '전용 없음'이어도 주차 가능
     available_keywords = [
         "주차가능",
         "주차장",
@@ -976,160 +956,129 @@ def is_parking_available(value):
         "주차지원",
         "매장앞",
         "매장옆",
-        "천변주차"
+        "천변주차",
+        "골목주차",
     ]
 
-    return any(
-        keyword in normalized_value
-        for keyword in available_keywords
-    )
+    exact_unavailable = {
+        "없음",
+        "전용없음",
+        "전용없음골목",
+        "주차불가",
+    }
+
+    if normalized_value in exact_unavailable:
+        return False
+
+    if "주차불가" in normalized_value:
+        return False
+
+    return any(keyword in normalized_value for keyword in available_keywords)
 
 
-# =========================================================
-# 19. 지역 일치 여부
-# =========================================================
+def matches_category(restaurant, category):
+    aliases = CATEGORY_ALIASES.get(category, {normalize_text(category)})
+    category_text = restaurant["category_search_text"]
 
-def matches_region(
-    restaurant,
-    selected_regions
-):
+    return any(alias in category_text for alias in aliases)
+
+
+def matches_region(restaurant, selected_regions):
     if not selected_regions:
         return True
 
     region_text = restaurant["region_search_text"]
-
-    return any(
-        normalize_text(region) in region_text
-        for region in selected_regions
-    )
+    return any(normalize_text(region) in region_text for region in selected_regions)
 
 
-# =========================================================
-# 20. 음식 검색어 일치 여부
-# =========================================================
-
-def matches_all_search_terms(
-    restaurant,
-    search_terms
-):
-    """
-    전북대 콩나물 국밥처럼 검색어가 여러 개면
-    모든 음식어가 포함된 식당을 우선 검색합니다.
-    """
-
+def matches_all_search_terms(restaurant, search_terms):
     if not search_terms:
         return True
 
     search_text = restaurant["food_search_text"]
-
-    return all(
-        normalize_text(term) in search_text
-        for term in search_terms
-    )
+    return all(normalize_text(term) in search_text for term in search_terms)
 
 
-def matches_any_search_term(
-    restaurant,
-    search_terms
-):
+def matches_any_search_term(restaurant, search_terms):
     if not search_terms:
-        return True
+        return False
 
     search_text = restaurant["food_search_text"]
-
-    return any(
-        normalize_text(term) in search_text
-        for term in search_terms
-    )
+    return any(normalize_text(term) in search_text for term in search_terms)
 
 
-# =========================================================
-# 21. 조건 필터링
-# =========================================================
+def is_available_flag(value):
+    return normalize_text(value) in {"추천", "가능"}
 
-def filter_restaurants(
-    state,
-    require_all_terms=True
-):
+
+def filter_restaurants(state, require_all_terms=True):
     filtered = []
 
     for restaurant in ALL_RESTAURANTS:
         data = restaurant["data"]
 
-        category = data.get("카테고리", "")
         parking = data.get("주차유형", "")
         solo = data.get("혼밥", "")
         family = data.get("가족식사", "")
         group = data.get("단체수용", "")
 
-        # 주차
-        if state["parking"]:
-            if not is_parking_available(parking):
-                continue
-
-        # 포함 카테고리
-        if state["include_categories"]:
-            if category not in state["include_categories"]:
-                continue
-
-        # 제외 카테고리
-        if category in state["exclude_categories"]:
+        if state["parking"] and not is_parking_available(parking):
             continue
 
-        # 포함 지역
-        if state["include_regions"]:
-            if not matches_region(
-                restaurant,
-                state["include_regions"]
-            ):
-                continue
+        if state["include_categories"] and not any(
+            matches_category(restaurant, category)
+            for category in state["include_categories"]
+        ):
+            continue
 
-        # 제외 지역
-        if state["exclude_regions"]:
-            if matches_region(
-                restaurant,
-                state["exclude_regions"]
-            ):
-                continue
+        # 카테고리뿐 아니라 업종의 '요리주점'도 주점 제외에 포함
+        if any(
+            matches_category(restaurant, category)
+            for category in state["exclude_categories"]
+        ):
+            continue
 
-        # 음식·업종·메인메뉴 직접 검색
+        if state["include_regions"] and not matches_region(
+            restaurant,
+            state["include_regions"],
+        ):
+            continue
+
+        if state["exclude_regions"] and matches_region(
+            restaurant,
+            state["exclude_regions"],
+        ):
+            continue
+
         if state["search_terms"]:
             if require_all_terms:
                 matched = matches_all_search_terms(
                     restaurant,
-                    state["search_terms"]
+                    state["search_terms"],
                 )
             else:
                 matched = matches_any_search_term(
                     restaurant,
-                    state["search_terms"]
+                    state["search_terms"],
                 )
 
             if not matched:
                 continue
 
-        # 제외 메뉴
-        if state["exclude_terms"]:
-            if matches_any_search_term(
-                restaurant,
-                state["exclude_terms"]
-            ):
-                continue
+        if state["exclude_terms"] and matches_any_search_term(
+            restaurant,
+            state["exclude_terms"],
+        ):
+            continue
 
-        # 혼밥
-        if state["solo"]:
-            if solo not in ["추천", "가능"]:
-                continue
+        if state["solo"] and not is_available_flag(solo):
+            continue
 
-        # 가족식사
-        if state["family"]:
-            if family not in ["추천", "가능"]:
-                continue
+        if state["family"] and not is_available_flag(family):
+            continue
 
-        # 단체수용
-        if state["group"]:
-            if group not in ["추천", "가능"]:
-                continue
+        if state["group"] and not is_available_flag(group):
+            continue
 
         filtered.append(restaurant)
 
@@ -1137,8 +1086,9 @@ def filter_restaurants(
 
 
 # =========================================================
-# 22. 코사인 유사도 계산
+# 13. 임베딩 유사도 및 최종 선택
 # =========================================================
+
 
 def cosine_similarity(vector_a, vector_b):
     if vector_a is None or vector_b is None:
@@ -1150,34 +1100,39 @@ def cosine_similarity(vector_a, vector_b):
     if norm_a == 0 or norm_b == 0:
         return 0.0
 
-    return float(
-        np.dot(vector_a, vector_b)
-        / (norm_a * norm_b)
-    )
+    return float(np.dot(vector_a, vector_b) / (norm_a * norm_b))
 
 
-# =========================================================
-# 23. 검색 결과 순위 계산
-# =========================================================
+def build_ranking_query(question, state):
+    """
+    '주점은 싫어'의 '주점'이 유사도 점수를 올리지 않도록
+    긍정 조건만으로 순위 계산용 질문을 새로 만듭니다.
+    """
 
-def calculate_keyword_bonus(
-    restaurant,
-    state
-):
+    parts = []
+
+    if state["parking"]:
+        parts.append("주차 가능")
+    if state["solo"]:
+        parts.append("혼밥 가능")
+    if state["family"]:
+        parts.append("가족 식사 가능")
+    if state["group"]:
+        parts.append("단체 이용 가능")
+
+    parts.extend(state["include_regions"])
+    parts.extend(state["include_categories"])
+    parts.extend(state["search_terms"])
+
+    return " ".join(parts + ["전주 맛집"]) if parts else question
+
+
+def calculate_keyword_bonus(restaurant, state):
     data = restaurant["data"]
-
     menu_text = normalize_text(
-        " ".join(
-            [
-                data.get("업종", ""),
-                data.get("메인메뉴", "")
-            ]
-        )
+        " ".join([data.get("업종", ""), data.get("메인메뉴", "")])
     )
-
-    name_text = normalize_text(
-        data.get("상호명", "")
-    )
+    name_text = normalize_text(data.get("상호명", ""))
 
     bonus = 0.0
 
@@ -1186,24 +1141,20 @@ def calculate_keyword_bonus(
 
         if normalized_term in menu_text:
             bonus += 0.20
-
         if normalized_term in name_text:
             bonus += 0.10
 
     return bonus
 
 
-def rank_restaurants(
-    question,
-    restaurants,
-    state
-):
+def rank_restaurants(question, restaurants, state):
+    ranking_query = build_ranking_query(question, state)
+
     try:
         query_vector = np.asarray(
-            embedding.embed_query(question),
-            dtype=np.float32
+            embedding.embed_query(ranking_query),
+            dtype=np.float32,
         )
-
     except Exception as error:
         print("질문 임베딩 오류:", error)
         query_vector = None
@@ -1213,65 +1164,39 @@ def rank_restaurants(
     for restaurant in restaurants:
         semantic_score = cosine_similarity(
             query_vector,
-            restaurant.get("embedding")
+            restaurant.get("embedding"),
         )
-
-        keyword_bonus = calculate_keyword_bonus(
-            restaurant,
-            state
-        )
+        keyword_bonus = calculate_keyword_bonus(restaurant, state)
 
         ranked.append(
             {
                 **restaurant,
-                "score": semantic_score + keyword_bonus
+                "score": semantic_score + keyword_bonus,
             }
         )
 
-    ranked.sort(
-        key=lambda item: item["score"],
-        reverse=True
-    )
-
+    ranked.sort(key=lambda item: item["score"], reverse=True)
     return ranked
 
 
-# =========================================================
-# 24. 최종 식당 선택
-# =========================================================
-
-def select_restaurants(
-    ranked,
-    count,
-    state
-):
+def select_restaurants(ranked, count, state):
     if not ranked:
         return []
 
-    # 사용자가 특정 음식이나 카테고리를 요청했다면
-    # 관련도 순서대로 선택
-    if (
-        state["search_terms"]
-        or state["include_categories"]
-    ):
+    if state["search_terms"] or state["include_categories"]:
         return ranked[:count]
 
-    # 특정 음식 요청이 없으면 같은 카테고리만
-    # 반복되지 않도록 여러 종류를 우선 선택
     selected = []
     selected_names = set()
     used_categories = set()
 
+    # 특정 음식 조건이 없으면 서로 다른 카테고리를 우선 추천
     for restaurant in ranked:
         data = restaurant["data"]
-
         name = data.get("상호명", "")
         category = data.get("카테고리", "")
 
-        if name in selected_names:
-            continue
-
-        if category in used_categories:
+        if name in selected_names or category in used_categories:
             continue
 
         selected.append(restaurant)
@@ -1281,12 +1206,8 @@ def select_restaurants(
         if len(selected) >= count:
             return selected
 
-    # 개수가 부족하면 카테고리 중복 허용
     for restaurant in ranked:
-        name = restaurant["data"].get(
-            "상호명",
-            ""
-        )
+        name = restaurant["data"].get("상호명", "")
 
         if name in selected_names:
             continue
@@ -1301,77 +1222,41 @@ def select_restaurants(
 
 
 # =========================================================
-# 25. 현재 검색 조건 표시
+# 14. 답변 생성
 # =========================================================
+
 
 def format_filter_state(state):
     conditions = []
 
     if state["parking"]:
         conditions.append("주차 가능")
-
     if state["solo"]:
         conditions.append("혼밥 가능")
-
     if state["family"]:
         conditions.append("가족식사 가능")
-
     if state["group"]:
         conditions.append("단체수용 가능")
-
     if state["include_categories"]:
-        conditions.append(
-            "카테고리: "
-            + ", ".join(state["include_categories"])
-        )
-
+        conditions.append("카테고리: " + ", ".join(state["include_categories"]))
     if state["exclude_categories"]:
-        conditions.append(
-            "제외 카테고리: "
-            + ", ".join(state["exclude_categories"])
-        )
-
+        conditions.append("제외 카테고리: " + ", ".join(state["exclude_categories"]))
     if state["include_regions"]:
-        conditions.append(
-            "지역: "
-            + ", ".join(state["include_regions"])
-        )
-
+        conditions.append("지역: " + ", ".join(state["include_regions"]))
     if state["exclude_regions"]:
-        conditions.append(
-            "제외 지역: "
-            + ", ".join(state["exclude_regions"])
-        )
-
+        conditions.append("제외 지역: " + ", ".join(state["exclude_regions"]))
     if state["search_terms"]:
-        conditions.append(
-            "검색 음식: "
-            + ", ".join(state["search_terms"])
-        )
-
+        conditions.append("검색 음식: " + ", ".join(state["search_terms"]))
     if state["exclude_terms"]:
-        conditions.append(
-            "제외 음식: "
-            + ", ".join(state["exclude_terms"])
-        )
+        conditions.append("제외 음식: " + ", ".join(state["exclude_terms"]))
 
-    if not conditions:
-        return "별도 조건 없음"
+    return " / ".join(conditions) if conditions else "별도 조건 없음"
 
-    return " / ".join(conditions)
-
-
-# =========================================================
-# 26. LLM에 전달할 데이터 생성
-# =========================================================
 
 def format_context(restaurants):
     documents = []
 
-    for index, restaurant in enumerate(
-        restaurants,
-        start=1
-    ):
+    for index, restaurant in enumerate(restaurants, start=1):
         data = restaurant["data"]
 
         documents.append(
@@ -1394,39 +1279,30 @@ def format_context(restaurants):
     return "\n\n".join(documents)
 
 
-# =========================================================
-# 27. 답변 프롬프트
-# =========================================================
-
 prompt = ChatPromptTemplate.from_template(
-"""
-당신은 전주 맛집 데이터를 기반으로 식당을 안내하는 AI입니다.
+    """
+당신은 직접 구축한 전주 맛집 데이터를 기반으로 안내하는 AI입니다.
 
 현재 적용된 검색 조건:
 {filter_description}
 
-조건 검색과 임베딩 유사도 검색을 통해 식당
-{selected_count}곳이 최종 선정되었습니다.
-
-반드시 아래 선정 식당을 모두 안내하세요.
+아래 식당 {selected_count}곳은 Python 코드에서 조건 검사를 통과한 최종 결과입니다.
+선정된 식당을 모두 빠짐없이 안내하세요.
 
 [답변 규칙]
-
 1. 제공된 식당 데이터만 사용하세요.
-2. 선정된 식당을 빠뜨리지 마세요.
-3. 같은 식당을 중복하지 마세요.
-4. 데이터에 없는 정보를 만들지 마세요.
-5. 제외 조건에 해당하는 식당은 추천하지 마세요.
-6. 가격은 가능한 경우 원 단위로 작성하세요.
-7. 각 식당이 질문 조건에 맞는 이유를 짧게 설명하세요.
-8. 자연스럽고 보기 좋게 정리하세요.
+2. 같은 식당을 중복하지 마세요.
+3. 데이터에 없는 정보를 만들지 마세요.
+4. 제외 조건에 해당하는 식당을 추가하지 마세요.
+5. 가격은 가능한 경우 원 단위로 보기 좋게 작성하세요.
+6. 추천 이유는 제공된 데이터와 질문 조건만 근거로 짧게 작성하세요.
+7. [식당이름] 같은 예시 문구를 그대로 출력하지 마세요.
 
 [출력 형식]
 
 조건에 맞는 전주 맛집은 다음과 같습니다.
 
 ### 1. 실제 상호명
-
 - 카테고리:
 - 업종:
 - 주소:
@@ -1440,11 +1316,9 @@ prompt = ChatPromptTemplate.from_template(
 - 추천 이유:
 
 [선정 식당 데이터]
-
 {context}
 
-[현재 사용자 질문]
-
+[사용자 질문]
 {question}
 """
 )
@@ -1452,40 +1326,27 @@ prompt = ChatPromptTemplate.from_template(
 chain = prompt | llm | StrOutputParser()
 
 
-# =========================================================
-# 28. 가격 표시
-# =========================================================
-
 def format_price(value):
     if value is None:
         return "정보 없음"
 
     text = str(value).strip()
 
-    if not text or text.lower() == "nan":
+    if not text or text.lower() in {"nan", "none"}:
         return "정보 없음"
 
+    numeric_text = text.replace(",", "").replace("원", "").strip()
+
     try:
-        return f"{int(float(text)):,}원"
-
+        return f"{int(float(numeric_text)):,}원"
     except ValueError:
-        return text
+        return text if text.endswith("원") else f"{text}원"
 
-
-# =========================================================
-# 29. LLM 실패 시 직접 출력
-# =========================================================
 
 def build_direct_answer(restaurants):
-    lines = [
-        "조건에 맞는 전주 맛집은 다음과 같습니다.",
-        ""
-    ]
+    lines = ["조건에 맞는 전주 맛집은 다음과 같습니다.", ""]
 
-    for index, restaurant in enumerate(
-        restaurants,
-        start=1
-    ):
+    for index, restaurant in enumerate(restaurants, start=1):
         data = restaurant["data"]
 
         lines.extend(
@@ -1502,7 +1363,7 @@ def build_direct_answer(restaurants):
                 f"- **혼밥:** {data.get('혼밥', '정보 없음')}",
                 f"- **가족식사:** {data.get('가족식사', '정보 없음')}",
                 f"- **단체수용:** {data.get('단체수용', '정보 없음')}",
-                ""
+                "",
             ]
         )
 
@@ -1510,41 +1371,29 @@ def build_direct_answer(restaurants):
 
 
 # =========================================================
-# 30. 최종 질문 처리
+# 15. 최종 질문 처리
 # =========================================================
 
-def ask(
-    question,
-    previous_state=None
-):
+
+def ask(question, previous_state=None):
     question = question.strip()
 
-    state = update_filter_state(
-        question,
-        previous_state
-    )
-
     if not question:
+        state = copy.deepcopy(previous_state or initial_filter_state())
         return "질문을 입력해 주세요.", state
 
-    # -----------------------------------------------------
-    # 1. 모든 검색어가 포함된 식당부터 검색
-    # -----------------------------------------------------
+    state = update_filter_state(question, previous_state)
 
     candidates = filter_restaurants(
         state,
-        require_all_terms=True
+        require_all_terms=True,
     )
 
-    # 검색어가 여러 개인데 결과가 없다면
-    # 하나 이상의 검색어가 포함된 식당으로 완화
-    if (
-        not candidates
-        and len(state["search_terms"]) >= 2
-    ):
+    # 두 개 이상의 메뉴 검색어를 모두 만족하는 식당이 없을 때만 OR 검색
+    if not candidates and len(state["search_terms"]) >= 2:
         candidates = filter_restaurants(
             state,
-            require_all_terms=False
+            require_all_terms=False,
         )
 
     print("\n" + "=" * 60)
@@ -1554,55 +1403,38 @@ def ask(
 
     if not candidates:
         return (
-            "현재 적용된 조건에 맞는 식당을 "
-            "데이터에서 찾지 못했습니다.\n\n"
+            "현재 적용된 조건에 맞는 식당을 데이터에서 찾지 못했습니다.\n\n"
             f"적용 조건: {format_filter_state(state)}",
-            state
+            state,
         )
-
-    # -----------------------------------------------------
-    # 2. 임베딩과 정확한 키워드로 순위 결정
-    # -----------------------------------------------------
 
     ranked = rank_restaurants(
         question,
         candidates,
-        state
+        state,
     )
 
-    count = min(
-        state["count"],
-        len(ranked)
-    )
-
+    count = min(state["count"], len(ranked))
     selected = select_restaurants(
         ranked,
         count,
-        state
+        state,
     )
 
     print("최종 추천 식당 수:", len(selected))
 
-    for index, restaurant in enumerate(
-        selected,
-        start=1
-    ):
+    for index, restaurant in enumerate(selected, start=1):
         data = restaurant["data"]
-
         print(
             f"{index}. {data.get('상호명')} "
             f"/ 카테고리: {data.get('카테고리')} "
-            f"/ 지역: {data.get('지역권')} "
             f"/ 업종: {data.get('업종')} "
-            f"/ 메뉴: {data.get('메인메뉴')} "
+            f"/ 지역: {data.get('지역권')} "
+            f"/ 주차: {data.get('주차유형')} "
             f"/ 점수: {restaurant.get('score', 0):.4f}"
         )
 
     print("=" * 60)
-
-    # -----------------------------------------------------
-    # 3. LLM 답변 생성
-    # -----------------------------------------------------
 
     context = format_context(selected)
 
@@ -1612,39 +1444,26 @@ def ask(
                 "question": question,
                 "context": context,
                 "selected_count": len(selected),
-                "filter_description": format_filter_state(state)
+                "filter_description": format_filter_state(state),
             }
         )
-
     except Exception as error:
         print("LLM 답변 생성 오류:", error)
-
         answer = build_direct_answer(selected)
 
-    # -----------------------------------------------------
-    # 4. LLM이 식당을 누락하면 직접 출력
-    # -----------------------------------------------------
-
-    for restaurant in selected:
-        name = restaurant["data"].get(
-            "상호명",
-            ""
-        )
-
-        if name and name not in answer:
-            print(
-                "LLM이 선정 식당을 누락하여 "
-                "직접 출력 방식으로 전환합니다."
-            )
-
-            answer = build_direct_answer(selected)
-            break
+    # LLM이 최종 선정 식당을 하나라도 누락하면 안전한 직접 출력으로 전환
+    if any(
+        restaurant["data"].get("상호명", "") not in answer
+        for restaurant in selected
+    ):
+        print("LLM이 선정 식당을 누락하여 직접 출력 방식으로 전환합니다.")
+        answer = build_direct_answer(selected)
 
     return answer, state
 
 
 # =========================================================
-# 31. rag.py 단독 테스트
+# 16. rag.py 단독 테스트
 # =========================================================
 
 if __name__ == "__main__":
@@ -1653,17 +1472,10 @@ if __name__ == "__main__":
     while True:
         user_question = input("\n질문: ").strip()
 
-        if user_question in [
-            "종료",
-            "exit",
-            "quit"
-        ]:
+        if user_question in {"종료", "exit", "quit"}:
             break
 
-        response, state = ask(
-            user_question,
-            state
-        )
+        response, state = ask(user_question, state)
 
         print("\n답변:")
         print(response)
